@@ -189,23 +189,18 @@ def relabel_dataset(
     ds_name: str,
     ds_version: str,
     data_dir: str,
-    writer: ArrayRecordWriter,
-    index: dict,
     policy,
     *,
     resize: int,
     batch_size: int,
     max_episodes: Optional[int],
     max_steps_per_episode: Optional[int],
-) -> int:
-    """Iterate over one RLDS dataset and append relabeled actions to writer.
+):
+    """Iterate over one RLDS dataset, yielding (step_id, actions) per step.
 
-    index is mutated in-place: index[step_id] = row_int (next free row).
-
-    Data is sharded across JAX processes via jax.process_count() /
-    jax.process_index(), consistent with the rest of the training codebase.
-
-    Returns the total number of steps written by this process.
+    Observations are accumulated into groups of batch_size before a single
+    batched model call; any remainder is flushed at the end of the dataset.
+    The caller owns writing to disk and index management.
     """
     import dlimp as dl
     import tensorflow as tf
@@ -236,22 +231,22 @@ def relabel_dataset(
     if max_episodes is not None:
         dataset = dataset.take(max_episodes)
 
-    steps_written = 0
     first_traj = True
+    logged_first_step = [False]  # mutable flag accessible from flush()
 
     # Pending batch: list of (step_id, obs) pairs not yet sent to the model.
     pending_ids: list[str] = []
     pending_obs: list[dict] = []
 
-    def flush_batch() -> None:
-        """Run inference on all pending obs and write results."""
-        nonlocal steps_written, first_traj
+    def flush() -> list[tuple[str, np.ndarray]]:
         if not pending_obs:
-            return
+            return []
         results = policy.infer_batch(pending_obs)
+        out = []
         for step_id, obs, result in zip(pending_ids, pending_obs, results):
             actions = np.asarray(result["actions"], dtype=np.float32)
-            if steps_written == 0:
+            if not logged_first_step[0]:
+                logged_first_step[0] = True
                 logging.info(f"  [step 0] obs keys: {list(obs.keys())}")
                 for k, v in obs.items():
                     v_info = f"shape={v.shape} dtype={v.dtype}" if isinstance(v, np.ndarray) else repr(v)
@@ -259,11 +254,10 @@ def relabel_dataset(
                 logging.info(f"  [step 0] action chunk shape: {actions.shape}")
                 logging.info(f"  [step 0] actions[:3]: {actions[:3]}")
                 logging.info("=== End first trajectory debug ===")
-            index[step_id] = len(index)
-            writer.write(encode_actions(actions))
-            steps_written += 1
+            out.append((step_id, actions))
         pending_ids.clear()
         pending_obs.clear()
+        return out
 
     for traj in tqdm.tqdm(
         dataset.as_numpy_iterator(),
@@ -327,69 +321,110 @@ def relabel_dataset(
             pending_obs.append(obs)
 
             if len(pending_obs) >= batch_size:
-                flush_batch()
+                yield from flush()
 
     # Flush any remaining steps that did not fill a full batch.
-    flush_batch()
-
-    return steps_written
+    yield from flush()
 
 
 # ---------------------------------------------------------------------------
 # Merge shards
 # ---------------------------------------------------------------------------
 
-def merge_shards(
-    local_dir: pathlib.Path, num_shards: int
-) -> tuple[pathlib.Path, pathlib.Path]:
-    """Merge all per-process ArrayRecord shards into one file + one index.
+def _download_from_gcs(gcs_path: str, local_path: pathlib.Path) -> None:
+    """Download a single GCS file to a local path in 64 MB chunks."""
+    import tensorflow as tf
 
-    Reads shards in batches of MERGE_BATCH to avoid per-record Python overhead.
-    Returns (arrayrecord_path, index_json_path).
+    logging.info(f"Downloading {gcs_path} -> {local_path} ...")
+    with tf.io.gfile.GFile(gcs_path, "rb") as f_in, open(local_path, "wb") as f_out:
+        while chunk := f_in.read(64 * 1024 * 1024):
+            f_out.write(chunk)
+
+
+def merge_all_shards(
+    local_dir: pathlib.Path,
+    num_procs: int,
+    gcs_dir: Optional[str] = None,
+) -> tuple[pathlib.Path, pathlib.Path]:
+    """Merge per-process checkpoint parts into one ArrayRecord + one index JSON.
+
+    Each process writes files named:
+        proc{i:05d}_ckpt{j:05d}.arrayrecord   – one or more checkpoint parts
+        proc{i:05d}_index.json                 – step_id → local_row (across all parts)
+
+    If gcs_dir is set, those files are read from GCS; each checkpoint part is
+    downloaded to a temporary local file, processed, then deleted immediately so
+    that local disk usage is bounded to one part at a time (plus the growing
+    merged output file).
+
+    Returns (arrayrecord_path, index_json_path), both written to local_dir.
     """
+    import tensorflow as tf
+
     merged_ar_path = local_dir / "relabeled_actions.arrayrecord"
     merged_idx_path = local_dir / "relabeled_actions_index.json"
-    logging.info(f"Merging {num_shards} shards into {merged_ar_path} ...")
+    logging.info(f"Merging {num_procs} process shard(s) into {merged_ar_path} ...")
 
     merged_index: dict[str, int] = {}
-    global_idx = 0
+    global_row = 0
 
     writer = ArrayRecordWriter(str(merged_ar_path), ARRAYRECORD_OPTIONS)
     try:
-        for i in tqdm.tqdm(range(num_shards), desc="Merging shards", unit="shard"):
-            shard_ar = local_dir / f"shard_{i:05d}_of_{num_shards:05d}.arrayrecord"
-            shard_idx = local_dir / f"shard_{i:05d}_of_{num_shards:05d}_index.json"
+        for proc in tqdm.tqdm(range(num_procs), desc="Merging processes", unit="proc"):
+            # ---- Load per-process index ----
+            idx_name = f"proc{proc:05d}_index.json"
+            if gcs_dir:
+                with tf.io.gfile.GFile(tf.io.gfile.join(gcs_dir, idx_name)) as f:
+                    proc_index: dict[str, int] = json.load(f)
+            else:
+                with open(local_dir / idx_name) as f:
+                    proc_index: dict[str, int] = json.load(f)
 
-            if not shard_ar.exists():
-                raise FileNotFoundError(f"Shard not found: {shard_ar}")
-            if not shard_idx.exists():
-                raise FileNotFoundError(f"Shard index not found: {shard_idx}")
+            # Reverse: local_row → step_id
+            row_to_step = {v: k for k, v in proc_index.items()}
 
-            with open(shard_idx) as f:
-                local_index: dict[str, int] = json.load(f)
+            # ---- Discover checkpoint parts for this process (ordered) ----
+            ckpt_glob = f"proc{proc:05d}_ckpt*.arrayrecord"
+            if gcs_dir:
+                ckpt_srcs = sorted(tf.io.gfile.glob(tf.io.gfile.join(gcs_dir, ckpt_glob)))
+            else:
+                ckpt_srcs = sorted(str(p) for p in local_dir.glob(ckpt_glob))
 
-            # Reverse: local row → step_id (built once per shard).
-            row_to_step = {v: k for k, v in local_index.items()}
+            if not ckpt_srcs:
+                raise FileNotFoundError(f"No checkpoint parts found for process {proc}")
 
-            reader = ArrayRecordReader(str(shard_ar))
-            num_records = reader.num_records()
+            # ---- Stream through parts one at a time ----
+            local_row = 0
+            for ckpt_src in tqdm.tqdm(ckpt_srcs, desc=f"  proc {proc}", unit="part", leave=False):
+                tmp: Optional[pathlib.Path] = None
+                if gcs_dir:
+                    tmp = local_dir / pathlib.Path(ckpt_src).name
+                    _download_from_gcs(ckpt_src, tmp)
+                    ar_src = str(tmp)
+                else:
+                    ar_src = ckpt_src
 
-            for start in range(0, num_records, MERGE_BATCH):
-                end = min(start + MERGE_BATCH, num_records)
-                batch = reader.read(list(range(start, end)))
-                for local_row, record in zip(range(start, end), batch):
-                    writer.write(record)
-                    merged_index[row_to_step[local_row]] = global_idx
-                    global_idx += 1
-
-            reader.close()
+                try:
+                    reader = ArrayRecordReader(ar_src)
+                    num_records = reader.num_records()
+                    for start in range(0, num_records, MERGE_BATCH):
+                        end = min(start + MERGE_BATCH, num_records)
+                        for record in reader.read(list(range(start, end))):
+                            writer.write(record)
+                            merged_index[row_to_step[local_row]] = global_row
+                            local_row += 1
+                            global_row += 1
+                    reader.close()
+                finally:
+                    if tmp is not None:
+                        tmp.unlink(missing_ok=True)
     finally:
         writer.close()
 
     with open(merged_idx_path, "w") as f:
         json.dump(merged_index, f)
 
-    logging.info(f"Merge complete: {global_idx:,} records -> {merged_ar_path}")
+    logging.info(f"Merge complete: {global_row:,} records -> {merged_ar_path}")
     return merged_ar_path, merged_idx_path
 
 
@@ -441,6 +476,12 @@ class Args:
     batch_size: int = 32
     """Number of steps to accumulate before a single batched model call."""
 
+    checkpoint_steps: int = 50_000
+    """Roll over to a new local shard file every this many steps, uploading and
+    deleting the completed part when output_dir is a gs:// path.  This bounds
+    local disk usage to roughly checkpoint_steps * bytes_per_record at a time.
+    Set to 0 to write a single file and upload only at the end."""
+
     # Merge mode
     merge: bool = False
     """If True, merge existing per-process shards in output_dir and exit.
@@ -484,11 +525,10 @@ def main(args: Args) -> None:
     if args.merge:
         mhu.sync_global_devices("pre_merge")
         if proc_idx == 0:
-            shard_files = sorted(local_dir.glob("shard_*_of_*.arrayrecord"))
-            if not shard_files:
-                raise FileNotFoundError(f"No shard files found in {local_dir}")
-            num_shards = int(shard_files[0].stem.split("_of_")[1])
-            merged_ar, merged_idx = merge_shards(local_dir, num_shards)
+            merged_ar, merged_idx = merge_all_shards(
+                local_dir, num_procs,
+                gcs_dir=args.output_dir if is_gcs_output else None,
+            )
             if is_gcs_output:
                 _upload_to_gcs(merged_ar, args.output_dir)
                 _upload_to_gcs(merged_idx, args.output_dir)
@@ -496,56 +536,90 @@ def main(args: Args) -> None:
         return
 
     # ---- Relabeling mode ----
-    if num_procs > 1:
-        ar_path = local_dir / f"shard_{proc_idx:05d}_of_{num_procs:05d}.arrayrecord"
-        idx_path = local_dir / f"shard_{proc_idx:05d}_of_{num_procs:05d}_index.json"
-    else:
-        ar_path = local_dir / "relabeled_actions.arrayrecord"
-        idx_path = local_dir / "relabeled_actions_index.json"
-
-    logging.info(f"[proc {proc_idx}] Output: {ar_path}")
-
     policy = load_policy(args.policy_config_name, args.checkpoint_path)
 
     index: dict[str, int] = {}
     total_steps = 0
+    part_idx = 0
+
+    def _ckpt_path(part: int) -> pathlib.Path:
+        return local_dir / f"proc{proc_idx:05d}_ckpt{part:05d}.arrayrecord"
+
+    ar_path = _ckpt_path(part_idx)
     writer = ArrayRecordWriter(str(ar_path), ARRAYRECORD_OPTIONS)
+    steps_in_part = 0
+    logging.info(f"[proc {proc_idx}] Writing checkpoint part {part_idx}: {ar_path}")
+
+    def _roll_over() -> None:
+        """Close current part, upload+delete if GCS, open the next part."""
+        nonlocal writer, ar_path, part_idx, steps_in_part
+        writer.close()
+        if is_gcs_output:
+            _upload_to_gcs(ar_path, args.output_dir)
+            ar_path.unlink()
+            logging.info(f"[proc {proc_idx}] Uploaded and deleted checkpoint part {part_idx}")
+        part_idx += 1
+        ar_path = _ckpt_path(part_idx)
+        writer = ArrayRecordWriter(str(ar_path), ARRAYRECORD_OPTIONS)
+        steps_in_part = 0
+        logging.info(f"[proc {proc_idx}] Opened checkpoint part {part_idx}: {ar_path}")
+
     try:
         for ds_spec in args.datasets:
             if ":" not in ds_spec:
                 raise ValueError(f"Dataset spec must be '<name>:<version>', got: {ds_spec!r}")
             ds_name, ds_version = ds_spec.split(":", 1)
-            steps = relabel_dataset(
+            steps_before = total_steps
+            for step_id, actions in relabel_dataset(
                 ds_name=ds_name,
                 ds_version=ds_version,
                 data_dir=args.data_dir,
-                writer=writer,
-                index=index,
                 policy=policy,
                 resize=args.resize,
                 batch_size=args.batch_size,
                 max_episodes=args.max_episodes,
                 max_steps_per_episode=args.max_steps_per_episode,
-            )
-            logging.info(f"[proc {proc_idx}] {ds_name}:{ds_version} -> {steps:,} steps written")
-            total_steps += steps
-    finally:
-        writer.close()
+            ):
+                index[step_id] = total_steps
+                writer.write(encode_actions(actions))
+                total_steps += 1
+                steps_in_part += 1
 
-    with open(idx_path, "w") as f:
-        json.dump(index, f)
+                if args.checkpoint_steps > 0 and total_steps % args.checkpoint_steps == 0:
+                    _roll_over()
+
+            logging.info(
+                f"[proc {proc_idx}] {ds_name}:{ds_version} -> {total_steps - steps_before:,} steps written"
+            )
+    finally:
+        # Close and upload the last (possibly partial) checkpoint part.
+        writer.close()
+        if is_gcs_output and steps_in_part > 0:
+            _upload_to_gcs(ar_path, args.output_dir)
+            ar_path.unlink()
+            logging.info(f"[proc {proc_idx}] Uploaded and deleted final checkpoint part {part_idx}")
+        elif steps_in_part == 0 and ar_path.exists():
+            ar_path.unlink()  # empty trailing file from exact rollover boundary
 
     logging.info(f"[proc {proc_idx}] Done. Total steps: {total_steps:,}")
+
+    # Write and upload per-process index.
+    idx_path = local_dir / f"proc{proc_idx:05d}_index.json"
+    with open(idx_path, "w") as f:
+        json.dump(index, f)
+    if is_gcs_output:
+        _upload_to_gcs(idx_path, args.output_dir)
+        idx_path.unlink()
 
     # Wait for all processes to finish writing their shards.
     mhu.sync_global_devices("relabeling_complete")
 
-    # Process 0 merges and (optionally) uploads to GCS.
+    # Process 0 merges and uploads the final combined files.
     if proc_idx == 0:
-        if num_procs > 1:
-            merged_ar, merged_idx = merge_shards(local_dir, num_procs)
-        else:
-            merged_ar, merged_idx = ar_path, idx_path
+        merged_ar, merged_idx = merge_all_shards(
+            local_dir, num_procs,
+            gcs_dir=args.output_dir if is_gcs_output else None,
+        )
         if is_gcs_output:
             _upload_to_gcs(merged_ar, args.output_dir)
             _upload_to_gcs(merged_idx, args.output_dir)
