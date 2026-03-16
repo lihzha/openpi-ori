@@ -146,8 +146,12 @@ def decode_actions(value: bytes) -> np.ndarray:
 # Policy loading
 # ---------------------------------------------------------------------------
 
-def load_policy(config_name: str, checkpoint_path: str):
-    """Load the policy and shard its parameters with FSDP, matching training."""
+def load_policy(config_name: str, checkpoint_path: str) -> tuple:
+    """Load the policy and shard its parameters with FSDP, matching training.
+
+    Returns:
+        (policy, mesh) where mesh is None for PyTorch models.
+    """
     logging.info(f"Loading policy '{config_name}' from '{checkpoint_path}' ...")
     config = _config.get_config(config_name)
 
@@ -157,7 +161,7 @@ def load_policy(config_name: str, checkpoint_path: str):
     # PyTorch models are not JAX-sharded; nothing to do.
     if policy._is_pytorch_model:
         logging.info("PyTorch model detected; skipping JAX FSDP sharding.")
-        return policy
+        return policy, None
 
     # Build the same FSDP mesh used during training so each device holds only
     # a slice of the parameters instead of a full replicated copy.
@@ -180,7 +184,7 @@ def load_policy(config_name: str, checkpoint_path: str):
     policy._sample_actions = nnx_utils.module_jit(policy._model.sample_actions)
 
     logging.info("Policy loaded and sharded across FSDP mesh.")
-    return policy
+    return policy, mesh
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +234,7 @@ def relabel_dataset(
     data_dir: str,
     policy,
     *,
+    mesh,
     resize: int,
     batch_size: int,
     max_episodes: Optional[int],
@@ -240,6 +245,12 @@ def relabel_dataset(
     Observations are accumulated into groups of batch_size before a single
     batched model call; any remainder is flushed at the end of the dataset.
     The caller owns writing to disk and index management.
+
+    Args:
+        mesh: JAX device mesh returned by load_policy. When not None, inference
+            calls are wrapped in set_mesh() so that activation_sharding_constraint
+            inside Gemma/SigLIP is active, and batched inputs are sharded across
+            all devices along DATA_AXIS for efficient FSDP inference.
     """
     import dlimp as dl
     import tensorflow as tf
@@ -270,6 +281,13 @@ def relabel_dataset(
     if max_episodes is not None:
         dataset = dataset.take(max_episodes)
 
+    # Build data sharding once; used in flush() to shard the batched inputs
+    # across all devices along DATA_AXIS, enabling proper FSDP inference.
+    data_sharding = (
+        jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(_sharding.DATA_AXIS))
+        if mesh is not None else None
+    )
+
     first_traj = True
     logged_first_step = [False]  # mutable flag accessible from flush()
 
@@ -280,7 +298,13 @@ def relabel_dataset(
     def flush() -> list[tuple[str, np.ndarray]]:
         if not pending_obs:
             return []
-        results = policy.infer_batch(pending_obs)
+        # set_mesh activates activation_sharding_constraint inside Gemma/SigLIP;
+        # without it those constraints are silently no-ops and FSDP is ineffective.
+        if mesh is not None:
+            with _sharding.set_mesh(mesh):
+                results = policy.infer_batch(pending_obs, data_sharding=data_sharding)
+        else:
+            results = policy.infer_batch(pending_obs)
         out = []
         for step_id, obs, result in zip(pending_ids, pending_obs, results):
             actions = np.asarray(result["actions"], dtype=np.float32)
@@ -583,7 +607,7 @@ def main(args: Args) -> None:
         return
 
     # ---- Relabeling mode ----
-    policy = load_policy(args.policy_config_name, args.checkpoint_path)
+    policy, mesh = load_policy(args.policy_config_name, args.checkpoint_path)
 
     index: dict[str, int] = {}
     total_steps = 0
@@ -622,6 +646,7 @@ def main(args: Args) -> None:
                 ds_version=ds_version,
                 data_dir=args.data_dir,
                 policy=policy,
+                mesh=mesh,
                 resize=args.resize,
                 batch_size=args.batch_size,
                 max_episodes=args.max_episodes,

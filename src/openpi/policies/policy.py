@@ -105,18 +105,27 @@ class Policy(BasePolicy):
         }
         return outputs
 
-    def infer_batch(self, obs_list: list[dict]) -> list[dict]:
+    def infer_batch(self, obs_list: list[dict], *, data_sharding=None) -> list[dict]:
         """Run inference on a list of observations in a single batched model call.
 
         Each obs is transformed independently (preserving per-sample transform
         semantics), then stacked into one batch for a single call to
         sample_actions.  Results are unbatched and output-transformed per sample.
+
+        Args:
+            data_sharding: Optional JAX sharding to apply to the stacked batch
+                before calling sample_actions. Pass a NamedSharding with
+                PartitionSpec(DATA_AXIS) when running inside a set_mesh context
+                so that the batch is distributed across all devices for efficient
+                FSDP inference.
         """
         # Apply input transforms per sample so string→token conversion etc. is handled.
         inputs_list = [self._input_transform(jax.tree.map(lambda x: x, obs)) for obs in obs_list]
 
         if not self._is_pytorch_model:
             batched = jax.tree.map(lambda *xs: jnp.asarray(np.stack(xs)), *inputs_list)
+            if data_sharding is not None:
+                batched = jax.device_put(batched, data_sharding)
             self._rng, sample_rng = jax.random.split(self._rng)
         else:
             batched = jax.tree.map(
