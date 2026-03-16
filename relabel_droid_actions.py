@@ -351,7 +351,7 @@ class Args:
     """Root directory of the DROID RLDS dataset(s)."""
 
     datasets: list[str] = dataclasses.field(
-        default_factory=lambda: ["droid:1.0.0"]
+        default_factory=lambda: ["droid:1.0.1"]
     )
     """Datasets to process, each as '<name>:<version>'."""
 
