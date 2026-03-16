@@ -155,7 +155,7 @@ def load_policy(config_name: str, checkpoint_path: str):
 
     # Build the same FSDP mesh used during training so each device holds only
     # a slice of the parameters instead of a full replicated copy.
-    mesh = _sharding.make_mesh(config.fsdp_devices)
+    mesh = _sharding.make_mesh(4)
     logging.info(
         f"FSDP mesh: shape={mesh.shape}, total devices={jax.device_count()}"
     )
