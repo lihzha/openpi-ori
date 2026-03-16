@@ -239,7 +239,7 @@ def relabel_dataset(
     import tensorflow as tf
     import tensorflow_datasets as tfds
 
-    tf.config.set_visible_devices([], "GPU")
+    # tf.config.set_visible_devices([], "TPU")
 
     proc_idx = jax.process_index()
     num_procs = jax.process_count()
