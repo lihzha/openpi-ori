@@ -98,8 +98,7 @@ MERGE_BATCH = 10_000
 # Record encoding
 # ---------------------------------------------------------------------------
 
-def init_logging(log_file: Optional[str] = None):
-    """Custom logging format for better readability."""
+def _make_log_formatter() -> logging.Formatter:
     level_mapping = {"DEBUG": "D", "INFO": "I", "WARNING": "W", "ERROR": "E", "CRITICAL": "C"}
 
     class CustomFormatter(logging.Formatter):
@@ -107,19 +106,26 @@ def init_logging(log_file: Optional[str] = None):
             record.levelname = level_mapping.get(record.levelname, record.levelname)
             return super().format(record)
 
-    formatter = CustomFormatter(
+    return CustomFormatter(
         fmt="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)-80s (%(process)d:%(filename)s:%(lineno)s)",
         datefmt="%H:%M:%S",
     )
 
+
+def _make_log_handler(log_file: str) -> logging.FileHandler:
+    handler = logging.FileHandler(log_file)
+    handler.setFormatter(_make_log_formatter())
+    return handler
+
+
+def init_logging(log_file: Optional[str] = None):
+    """Custom logging format for better readability."""
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
-    logger.handlers[0].setFormatter(formatter)
+    logger.handlers[0].setFormatter(_make_log_formatter())
 
     if log_file is not None:
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+        logger.addHandler(_make_log_handler(log_file))
         logging.info(f"Logging to file: {log_file}")
 
 
@@ -535,16 +541,24 @@ def main(args: Args) -> None:
     num_procs = jax.process_count()
 
     # ArrayRecord cannot stream writes to GCS; write shards locally and upload.
+    # The temp dir is created in the current working directory so it is easy to
+    # locate and is not silently cleaned up by the OS.
     is_gcs_output = args.output_dir.startswith("gs://")
     if is_gcs_output:
-        local_dir = pathlib.Path(tempfile.mkdtemp(prefix="droid_relabel_"))
+        local_dir = pathlib.Path(tempfile.mkdtemp(prefix="droid_relabel_", dir="."))
     else:
         local_dir = pathlib.Path(args.output_dir)
     local_dir.mkdir(parents=True, exist_ok=True)
 
+    # Primary log inside the shard directory; secondary log in CWD for easy access.
     log_file = str(local_dir / f"relabel_proc{proc_idx:05d}.log")
-    print(f"Initializing logging... (log file: {log_file})")
+    cwd_log_file = str(pathlib.Path(".") / f"relabel_proc{proc_idx:05d}.log")
+    print(f"Initializing logging... (log files: {log_file}, {cwd_log_file})")
     init_logging(log_file=log_file)
+    # Add the CWD log file as a second handler.
+    logging.getLogger().addHandler(
+        _make_log_handler(cwd_log_file)
+    )
     logging.info(
         f"JAX: process {proc_idx}/{num_procs}, "
         f"local devices: {jax.local_device_count()}, "
