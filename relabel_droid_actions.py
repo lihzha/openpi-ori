@@ -94,6 +94,25 @@ MERGE_BATCH = 10_000
 # Record encoding
 # ---------------------------------------------------------------------------
 
+def init_logging():
+    """Custom logging format for better readability."""
+    level_mapping = {"DEBUG": "D", "INFO": "I", "WARNING": "W", "ERROR": "E", "CRITICAL": "C"}
+
+    class CustomFormatter(logging.Formatter):
+        def format(self, record):
+            record.levelname = level_mapping.get(record.levelname, record.levelname)
+            return super().format(record)
+
+    formatter = CustomFormatter(
+        fmt="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)-80s (%(process)d:%(filename)s:%(lineno)s)",
+        datefmt="%H:%M:%S",
+    )
+
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    logger.handlers[0].setFormatter(formatter)
+
+
 def encode_actions(actions: np.ndarray) -> bytes:
     """Pack an (chunk_len, action_dim) float32 array into bytes."""
     chunk_len, action_dim = actions.shape
@@ -405,9 +424,8 @@ class Args:
 
 
 def main(args: Args) -> None:
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-    )
+    print("Initializing logging...")
+    init_logging()
 
     # Initialize JAX distributed if running in a multi-process context.
     # On a single TPU VM all devices are in one process; this is a no-op.
