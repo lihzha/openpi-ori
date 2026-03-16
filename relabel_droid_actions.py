@@ -211,6 +211,7 @@ def relabel_dataset(
         dataset = dataset.take(max_episodes)
 
     steps_written = 0
+    first_traj = True
 
     for traj in tqdm.tqdm(
         dataset.as_numpy_iterator(),
@@ -222,14 +223,29 @@ def relabel_dataset(
         recording_folder = ep_meta["recording_folderpath"][0].decode()
         file_path = ep_meta["file_path"][0].decode()
 
-        # Use the first language instruction (consistent with make_droid_example).
-        prompt = traj["language_instruction"].decode()
+        # language_instruction may be a scalar bytes or a 1-D numpy array of bytes.
+        lang = traj["language_instruction"]
+        prompt = (lang.flat[0] if isinstance(lang, np.ndarray) else lang).decode()
 
         # ---- Per-step arrays ----
         ext_imgs_1 = traj["observation"]["exterior_image_1_left"]   # (T,) encoded
         wrist_imgs = traj["observation"]["wrist_image_left"]         # (T,) encoded
         joint_pos = traj["observation"]["joint_position"]            # (T, 7)
         gripper_pos = traj["observation"]["gripper_position"]        # (T, 1)
+
+        if first_traj:
+            first_traj = False
+            logging.info("=== First trajectory debug ===")
+            logging.info(f"  recording_folder : {recording_folder}")
+            logging.info(f"  file_path        : {file_path}")
+            logging.info(f"  prompt           : {prompt!r}")
+            logging.info(f"  language_instruction raw type/shape: "
+                         f"{type(traj['language_instruction'])}, "
+                         f"{getattr(traj['language_instruction'], 'shape', 'n/a')}")
+            logging.info(f"  joint_position   shape: {joint_pos.shape}, dtype: {joint_pos.dtype}")
+            logging.info(f"  gripper_position shape: {gripper_pos.shape}, dtype: {gripper_pos.dtype}")
+            logging.info(f"  ext_imgs_1       shape: {ext_imgs_1.shape}, dtype: {ext_imgs_1.dtype}")
+            logging.info(f"  wrist_imgs       shape: {wrist_imgs.shape}, dtype: {wrist_imgs.dtype}")
 
         num_steps = joint_pos.shape[0]
         if max_steps_per_episode is not None:
@@ -255,6 +271,15 @@ def relabel_dataset(
 
             result = policy.infer(obs)
             actions = np.asarray(result["actions"], dtype=np.float32)
+
+            if steps_written == 0:
+                logging.info(f"  [step 0] obs keys: {list(obs.keys())}")
+                for k, v in obs.items():
+                    v_info = f"shape={v.shape} dtype={v.dtype}" if isinstance(v, np.ndarray) else repr(v)
+                    logging.info(f"    obs[{k!r}]: {v_info}")
+                logging.info(f"  [step 0] action chunk shape: {actions.shape}")
+                logging.info(f"  [step 0] actions[:3]: {actions[:3]}")
+                logging.info("=== End first trajectory debug ===")
 
             # Construct the same step_id as droid_rlds_dataset.py.
             step_id = f"{recording_folder}--{file_path}--{t}"
