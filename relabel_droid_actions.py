@@ -78,8 +78,12 @@ import tqdm
 import tyro
 from array_record.python.array_record_module import ArrayRecordReader, ArrayRecordWriter
 
+import flax.nnx as nnx
+
 from openpi.policies import policy_config
+from openpi.shared import nnx_utils
 from openpi.training import config as _config
+from openpi.training import sharding as _sharding
 
 
 # One record per riegeli chunk → O(1) random access with minimal read
@@ -137,10 +141,39 @@ def decode_actions(value: bytes) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def load_policy(config_name: str, checkpoint_path: str):
+    """Load the policy and shard its parameters with FSDP, matching training."""
     logging.info(f"Loading policy '{config_name}' from '{checkpoint_path}' ...")
     config = _config.get_config(config_name)
+
+    # Standard load — params are initially fully replicated across all devices.
     policy = policy_config.create_trained_policy(config, checkpoint_path)
-    logging.info("Policy loaded.")
+
+    # PyTorch models are not JAX-sharded; nothing to do.
+    if policy._is_pytorch_model:
+        logging.info("PyTorch model detected; skipping JAX FSDP sharding.")
+        return policy
+
+    # Build the same FSDP mesh used during training so each device holds only
+    # a slice of the parameters instead of a full replicated copy.
+    mesh = _sharding.make_mesh(config.fsdp_devices)
+    logging.info(
+        f"FSDP mesh: shape={mesh.shape}, total devices={jax.device_count()}"
+    )
+
+    # Compute per-parameter FSDP sharding specs from the current (replicated) state.
+    graphdef, state = nnx.split(policy._model)
+    state_sharding = _sharding.fsdp_sharding(
+        jax.eval_shape(lambda s: s, state), mesh, log=True
+    )
+
+    # Reshard parameters in-place and rebuild the model.
+    sharded_state = jax.device_put(state, state_sharding)
+    policy._model = nnx.merge(graphdef, sharded_state)
+
+    # Rebuild the JIT so it captures the newly sharded state.
+    policy._sample_actions = nnx_utils.module_jit(policy._model.sample_actions)
+
+    logging.info("Policy loaded and sharded across FSDP mesh.")
     return policy
 
 
