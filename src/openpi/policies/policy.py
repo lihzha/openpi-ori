@@ -105,6 +105,52 @@ class Policy(BasePolicy):
         }
         return outputs
 
+    def infer_batch(self, obs_list: list[dict]) -> list[dict]:
+        """Run inference on a list of observations in a single batched model call.
+
+        Each obs is transformed independently (preserving per-sample transform
+        semantics), then stacked into one batch for a single call to
+        sample_actions.  Results are unbatched and output-transformed per sample.
+        """
+        # Apply input transforms per sample so string→token conversion etc. is handled.
+        inputs_list = [self._input_transform(jax.tree.map(lambda x: x, obs)) for obs in obs_list]
+
+        if not self._is_pytorch_model:
+            batched = jax.tree.map(lambda *xs: jnp.asarray(np.stack(xs)), *inputs_list)
+            self._rng, sample_rng = jax.random.split(self._rng)
+        else:
+            batched = jax.tree.map(
+                lambda *xs: torch.stack(
+                    [torch.from_numpy(np.array(x)).to(self._pytorch_device) for x in xs]
+                ),
+                *inputs_list,
+            )
+            sample_rng = self._pytorch_device
+
+        observation = _model.Observation.from_dict(batched)
+        start_time = time.monotonic()
+        raw_actions = self._sample_actions(sample_rng, observation, **self._sample_kwargs)
+        raw_state = batched["state"]
+        model_time = time.monotonic() - start_time
+
+        results = []
+        for i in range(len(obs_list)):
+            if self._is_pytorch_model:
+                out = {
+                    "state": np.asarray(raw_state[i].detach().cpu()),
+                    "actions": np.asarray(raw_actions[i].detach().cpu()),
+                }
+            else:
+                out = {
+                    "state": np.asarray(raw_state[i]),
+                    "actions": np.asarray(raw_actions[i]),
+                }
+            out = self._output_transform(out)
+            out["policy_timing"] = {"infer_ms": model_time * 1000 / len(obs_list)}
+            results.append(out)
+
+        return results
+
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata

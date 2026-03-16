@@ -94,7 +94,7 @@ MERGE_BATCH = 10_000
 # Record encoding
 # ---------------------------------------------------------------------------
 
-def init_logging():
+def init_logging(log_file: Optional[str] = None):
     """Custom logging format for better readability."""
     level_mapping = {"DEBUG": "D", "INFO": "I", "WARNING": "W", "ERROR": "E", "CRITICAL": "C"}
 
@@ -111,6 +111,12 @@ def init_logging():
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     logger.handlers[0].setFormatter(formatter)
+
+    if log_file is not None:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+        logging.info(f"Logging to file: {log_file}")
 
 
 def encode_actions(actions: np.ndarray) -> bytes:
@@ -188,6 +194,7 @@ def relabel_dataset(
     policy,
     *,
     resize: int,
+    batch_size: int,
     max_episodes: Optional[int],
     max_steps_per_episode: Optional[int],
 ) -> int:
@@ -232,10 +239,37 @@ def relabel_dataset(
     steps_written = 0
     first_traj = True
 
+    # Pending batch: list of (step_id, obs) pairs not yet sent to the model.
+    pending_ids: list[str] = []
+    pending_obs: list[dict] = []
+
+    def flush_batch() -> None:
+        """Run inference on all pending obs and write results."""
+        nonlocal steps_written, first_traj
+        if not pending_obs:
+            return
+        results = policy.infer_batch(pending_obs)
+        for step_id, obs, result in zip(pending_ids, pending_obs, results):
+            actions = np.asarray(result["actions"], dtype=np.float32)
+            if steps_written == 0:
+                logging.info(f"  [step 0] obs keys: {list(obs.keys())}")
+                for k, v in obs.items():
+                    v_info = f"shape={v.shape} dtype={v.dtype}" if isinstance(v, np.ndarray) else repr(v)
+                    logging.info(f"    obs[{k!r}]: {v_info}")
+                logging.info(f"  [step 0] action chunk shape: {actions.shape}")
+                logging.info(f"  [step 0] actions[:3]: {actions[:3]}")
+                logging.info("=== End first trajectory debug ===")
+            index[step_id] = len(index)
+            writer.write(encode_actions(actions))
+            steps_written += 1
+        pending_ids.clear()
+        pending_obs.clear()
+
     for traj in tqdm.tqdm(
         dataset.as_numpy_iterator(),
         desc=f"[proc {proc_idx}/{num_procs}] {ds_name}:{ds_version}",
         unit="ep",
+        miniters=10,
     ):
         # ---- Extract trajectory-level metadata ----
         ep_meta = traj["traj_metadata"]["episode_metadata"]
@@ -288,24 +322,15 @@ def relabel_dataset(
                 resize=resize,
             )
 
-            result = policy.infer(obs)
-            actions = np.asarray(result["actions"], dtype=np.float32)
-
-            if steps_written == 0:
-                logging.info(f"  [step 0] obs keys: {list(obs.keys())}")
-                for k, v in obs.items():
-                    v_info = f"shape={v.shape} dtype={v.dtype}" if isinstance(v, np.ndarray) else repr(v)
-                    logging.info(f"    obs[{k!r}]: {v_info}")
-                logging.info(f"  [step 0] action chunk shape: {actions.shape}")
-                logging.info(f"  [step 0] actions[:3]: {actions[:3]}")
-                logging.info("=== End first trajectory debug ===")
-
-            # Construct the same step_id as droid_rlds_dataset.py.
             step_id = f"{recording_folder}--{file_path}--{t}"
-            index[step_id] = len(index)
-            writer.write(encode_actions(actions))
+            pending_ids.append(step_id)
+            pending_obs.append(obs)
 
-            steps_written += 1
+            if len(pending_obs) >= batch_size:
+                flush_batch()
+
+    # Flush any remaining steps that did not fill a full batch.
+    flush_batch()
 
     return steps_written
 
@@ -413,6 +438,9 @@ class Args:
     resize: int = 224
     """Target image size (square) for policy inference."""
 
+    batch_size: int = 32
+    """Number of steps to accumulate before a single batched model call."""
+
     # Merge mode
     merge: bool = False
     """If True, merge existing per-process shards in output_dir and exit.
@@ -424,9 +452,6 @@ class Args:
 
 
 def main(args: Args) -> None:
-    print("Initializing logging...")
-    init_logging()
-
     # Initialize JAX distributed if running in a multi-process context.
     # On a single TPU VM all devices are in one process; this is a no-op.
     if os.environ.get("JAX_COORDINATOR_ADDRESS") or os.environ.get("SLURM_NTASKS"):
@@ -434,20 +459,26 @@ def main(args: Args) -> None:
 
     proc_idx = jax.process_index()
     num_procs = jax.process_count()
+
+    # ArrayRecord cannot stream writes to GCS; write shards locally and upload.
+    is_gcs_output = args.output_dir.startswith("gs://")
+    if is_gcs_output:
+        local_dir = pathlib.Path(tempfile.mkdtemp(prefix="droid_relabel_"))
+    else:
+        local_dir = pathlib.Path(args.output_dir)
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    log_file = str(local_dir / f"relabel_proc{proc_idx:05d}.log")
+    print(f"Initializing logging... (log file: {log_file})")
+    init_logging(log_file=log_file)
     logging.info(
         f"JAX: process {proc_idx}/{num_procs}, "
         f"local devices: {jax.local_device_count()}, "
         f"total devices: {jax.device_count()}"
     )
 
-    # ArrayRecord cannot stream writes to GCS; write shards locally and upload.
-    is_gcs_output = args.output_dir.startswith("gs://")
     if is_gcs_output:
-        local_dir = pathlib.Path(tempfile.mkdtemp(prefix="droid_relabel_"))
         logging.info(f"GCS output detected; writing shards locally to {local_dir}")
-    else:
-        local_dir = pathlib.Path(args.output_dir)
-    local_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Merge-only mode ----
     if args.merge:
@@ -492,6 +523,7 @@ def main(args: Args) -> None:
                 index=index,
                 policy=policy,
                 resize=args.resize,
+                batch_size=args.batch_size,
                 max_episodes=args.max_episodes,
                 max_steps_per_episode=args.max_steps_per_episode,
             )
