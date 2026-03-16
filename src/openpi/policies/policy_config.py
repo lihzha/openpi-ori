@@ -3,6 +3,7 @@ import os
 import pathlib
 from typing import Any
 
+from etils import epath
 import jax.numpy as jnp
 
 import openpi.models.model as _model
@@ -43,15 +44,18 @@ def create_trained_policy(
         presence of "model.safensors" in the checkpoint directory.
     """
     repack_transforms = repack_transforms or transforms.Group()
-    checkpoint_dir = download.maybe_download(str(checkpoint_dir))
+    if str(checkpoint_dir).startswith("gs://"):
+        checkpoint_dir = epath.Path(str(checkpoint_dir))
+    else:
+        checkpoint_dir = download.maybe_download(str(checkpoint_dir))
 
     # Check if this is a PyTorch model by looking for model.safetensors
-    weight_path = os.path.join(checkpoint_dir, "model.safetensors")
-    is_pytorch = os.path.exists(weight_path)
+    weight_path = epath.Path(checkpoint_dir) / "model.safetensors"
+    is_pytorch = weight_path.exists()
 
     logging.info("Loading model...")
     if is_pytorch:
-        model = train_config.model.load_pytorch(train_config, weight_path)
+        model = train_config.model.load_pytorch(train_config, str(weight_path))
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))

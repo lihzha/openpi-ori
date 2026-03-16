@@ -79,7 +79,6 @@ import tyro
 from array_record.python.array_record_module import ArrayRecordReader, ArrayRecordWriter
 
 from openpi.policies import policy_config
-from openpi.shared import download
 from openpi.training import config as _config
 
 
@@ -115,8 +114,7 @@ def decode_actions(value: bytes) -> np.ndarray:
 def load_policy(config_name: str, checkpoint_path: str):
     logging.info(f"Loading policy '{config_name}' from '{checkpoint_path}' ...")
     config = _config.get_config(config_name)
-    checkpoint_dir = download.maybe_download(checkpoint_path)
-    policy = policy_config.create_trained_policy(config, checkpoint_dir)
+    policy = policy_config.create_trained_policy(config, checkpoint_path)
     logging.info("Policy loaded.")
     return policy
 
