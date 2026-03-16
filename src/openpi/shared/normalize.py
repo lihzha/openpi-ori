@@ -140,6 +140,15 @@ def save(directory: pathlib.Path | str, norm_stats: dict[str, NormStats]) -> Non
 
 def load(directory: pathlib.Path | str) -> dict[str, NormStats]:
     """Load the normalization stats from a directory."""
+    directory = str(directory)
+    if directory.startswith("gs://"):
+        import tensorflow as tf
+
+        path = directory.rstrip("/") + "/norm_stats.json"
+        if not tf.io.gfile.exists(path):
+            raise FileNotFoundError(f"Norm stats file not found at: {path}")
+        with tf.io.gfile.GFile(path, "r") as f:
+            return deserialize_json(f.read())
     path = pathlib.Path(directory) / "norm_stats.json"
     if not path.exists():
         raise FileNotFoundError(f"Norm stats file not found at: {path}")
